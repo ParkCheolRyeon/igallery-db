@@ -1,0 +1,154 @@
+name: Migrate RDS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - production
+        default: production
+      skip_backup:
+        description: 'Skip RDS pre-deploy snapshot (NOT recommended)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: migrate-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  DB_INSTANCE_ID: igallerydb-postgres9dc8bb04-0pxykud8e4t5
+  DB_SECRET_ARN: arn:aws:secretsmanager:ap-northeast-2:588344796279:secret:IgalleryDbPostgresSecret4DD-q83gHXdiMlXH-PWMA7N
+
+jobs:
+  migrate:
+    runs-on: [self-hosted, igallery-db-migrate]
+    steps:
+      - name: Checkout (HEAD)
+        uses: actions/checkout@v4
+
+      - name: Verify tools
+        run: |
+          migrate -version
+          aws --version
+          jq --version
+          python3 --version
+
+      - name: Load DATABASE_URL from Secrets Manager
+        id: load-db
+        run: |
+          set -e
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$DB_SECRET_ARN" \
+            --region "$AWS_REGION" \
+            --query SecretString \
+            --output text)
+          USER=$(jq -r .username <<<"$SECRET_JSON")
+          PASS=$(jq -r .password <<<"$SECRET_JSON")
+          HOST=$(jq -r .host <<<"$SECRET_JSON")
+          PORT=$(jq -r .port <<<"$SECRET_JSON")
+          DB=$(jq -r .dbname <<<"$SECRET_JSON")
+          # password URL-encode (특수문자 대응)
+          ENC_PASS=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$PASS")
+          DATABASE_URL="postgres://$USER:$ENC_PASS@$HOST:$PORT/$DB?sslmode=require"
+          # 로그 마스킹
+          echo "::add-mask::$PASS"
+          echo "::add-mask::$ENC_PASS"
+          echo "::add-mask::$DATABASE_URL"
+          {
+            echo "database_url<<EOF"
+            echo "$DATABASE_URL"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ DATABASE_URL loaded for db=$DB"
+
+      - name: Pre-deploy RDS snapshot
+        id: snapshot
+        if: ${{ !inputs.skip_backup }}
+        run: |
+          set -e
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          SNAP_ID="${{ inputs.environment }}-pre-deploy-${SHORT_SHA}-${TS}"
+          echo "📸 Creating snapshot: $SNAP_ID"
+          aws rds create-db-snapshot \
+            --db-instance-identifier "$DB_INSTANCE_ID" \
+            --db-snapshot-identifier "$SNAP_ID" \
+            --region "$AWS_REGION" \
+            --tags "Key=Environment,Value=${{ inputs.environment }}" \
+                   "Key=Purpose,Value=pre-migrate-backup" \
+                   "Key=WorkflowRun,Value=${{ github.run_id }}" \
+                   "Key=Commit,Value=$SHORT_SHA" > /dev/null
+          echo "snapshot_id=$SNAP_ID" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "⏳ Waiting for snapshot to be available (production) — 보통 1~5 분"
+            aws rds wait db-snapshot-available \
+              --db-snapshot-identifier "$SNAP_ID" \
+              --region "$AWS_REGION" || echo "::warning::Snapshot wait timed out, continuing anyway"
+            echo "✅ Snapshot ready: $SNAP_ID"
+          else
+            echo "✅ Snapshot creation initiated (no wait)"
+          fi
+
+      - name: Current migration state
+        env:
+          DATABASE_URL: ${{ steps.load-db.outputs.database_url }}
+        run: |
+          echo "=== migration version BEFORE ==="
+          migrate -path migrations -database "$DATABASE_URL" version 2>&1 || true
+
+      - name: Migrate up
+        env:
+          DATABASE_URL: ${{ steps.load-db.outputs.database_url }}
+        run: |
+          set -e
+          echo "🚀 Applying migrations..."
+          migrate -path migrations -database "$DATABASE_URL" up
+          echo ""
+          echo "=== migration version AFTER ==="
+          migrate -path migrations -database "$DATABASE_URL" version
+
+      - name: Cleanup old pre-deploy snapshots (retention 5)
+        if: ${{ !inputs.skip_backup && always() }}
+        run: |
+          RETENTION=5
+          PREFIX="${{ inputs.environment }}-pre-deploy-"
+          SNAPS=$(aws rds describe-db-snapshots \
+            --db-instance-identifier "$DB_INSTANCE_ID" \
+            --snapshot-type manual \
+            --region "$AWS_REGION" \
+            --query "DBSnapshots[?starts_with(DBSnapshotIdentifier, '$PREFIX')]|sort_by(@, &SnapshotCreateTime)|[*].DBSnapshotIdentifier" \
+            --output text)
+          if [ -z "$SNAPS" ]; then
+            echo "No snapshots to cleanup"; exit 0
+          fi
+          TOTAL=$(echo "$SNAPS" | wc -w | tr -d ' ')
+          echo "Found $TOTAL pre-deploy snapshots (retention=$RETENTION)"
+          if [ "$TOTAL" -le "$RETENTION" ]; then
+            echo "Nothing to delete"; exit 0
+          fi
+          DELETE=$((TOTAL - RETENTION))
+          for SNAP in $(echo "$SNAPS" | tr '\t' '\n' | head -n "$DELETE"); do
+            echo "🗑️ Deleting: $SNAP"
+            aws rds delete-db-snapshot --db-snapshot-identifier "$SNAP" --region "$AWS_REGION" >/dev/null || true
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Migrate to ${{ inputs.environment }}"
+            echo ""
+            echo "- **Status**: ${{ job.status }}"
+            echo "- **Commit**: \`${{ github.sha }}\`"
+            echo "- **Triggered by**: @${{ github.actor }}"
+            echo "- **Snapshot**: \`${{ steps.snapshot.outputs.snapshot_id || 'skipped' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
