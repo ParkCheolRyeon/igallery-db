@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install sqlc
+        uses: sqlc-dev/setup-sqlc@v4
+        with:
+          sqlc-version: '1.31.0'
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: sqlc generate (drift check)
+        # queries / migrations 가 바뀌었는데 db/ 재생성을 잊은 PR 을 잡는다.
+        run: |
+          sqlc generate
+          if ! git diff --exit-code db/; then
+            echo "::error::sqlc 생성물(db/)이 queries/migrations 와 동기화되지 않았습니다."
+            echo "::error::로컬에서 'sqlc generate' 실행 후 db/ 변경분을 함께 커밋해주세요."
+            exit 1
+          fi
+
+      - name: Migration filename convention
+        # 000001_*.up.sql / 000001_*.down.sql 형식 강제
+        run: |
+          fail=0
+          for f in migrations/*.sql; do
+            base=$(basename "$f")
+            if [[ ! "$base" =~ ^[0-9]{6}_[a-z0-9_]+\.(up|down)\.sql$ ]]; then
+              echo "::error file=$f::Bad migration filename: $base"
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || exit 1
+
+      - name: Up/down migration pairing
+        # 모든 up.sql 에 대응되는 down.sql 이 있어야 함
+        run: |
+          fail=0
+          for up in migrations/*.up.sql; do
+            down="${up%.up.sql}.down.sql"
+            if [ ! -f "$down" ]; then
+              echo "::error file=$up::Missing matching down migration: $down"
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || exit 1

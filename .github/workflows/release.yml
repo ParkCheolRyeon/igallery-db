@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '릴리즈 버전 (예: v0.2.0) — semver vMAJOR.MINOR.PATCH'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Validate version format
+        run: |
+          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must match vMAJOR.MINOR.PATCH (e.g. v0.2.0). Got: ${{ inputs.version }}"
+            exit 1
+          fi
+
+      - name: Ensure tag does not exist
+        run: |
+          if git rev-parse "${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ inputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Build & vet (sanity)
+        run: |
+          go vet ./...
+          go build ./...
+
+      - name: Collect changelog since last tag
+        id: changelog
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="$LAST_TAG..HEAD"
+            HEADER="### Changes since $LAST_TAG"
+          else
+            RANGE=""
+            HEADER="### Changes (initial range)"
+          fi
+
+          COMMITS=$(git log --pretty=format:"- %s (%h)" $RANGE)
+          MIGRATIONS=$(git diff --name-only $RANGE -- migrations/ 2>/dev/null | grep -E '\.up\.sql$' || true)
+
+          {
+            echo "changelog<<EOF"
+            echo "$HEADER"
+            echo ""
+            echo "$COMMITS"
+            if [ -n "$MIGRATIONS" ]; then
+              echo ""
+              echo "### New migrations"
+              echo ""
+              echo "$MIGRATIONS" | sed 's|^|- |'
+            fi
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+
+      - name: Create & push tag
+        run: |
+          git tag "${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.version }}" \
+            --title "Release ${{ inputs.version }}" \
+            --notes "${{ steps.changelog.outputs.changelog }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## ✅ Released ${{ inputs.version }}"
+            echo ""
+            echo "- Tag: \`${{ inputs.version }}\`"
+            echo "- Previous tag: \`${{ steps.changelog.outputs.last_tag }}\`"
+            echo ""
+            echo "### Next step in host repo"
+            echo ""
+            echo "\`\`\`bash"
+            echo "cd apps/dp-back  # or wherever the consumer is"
+            echo "go get github.com/ParkCheolRyeon/igallery-db@${{ inputs.version }}"
+            echo "go mod tidy"
+            echo "\`\`\`"
+          } >> $GITHUB_STEP_SUMMARY
