@@ -106,6 +106,12 @@ type IdentityVerification struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type MigrationTest struct {
+	ID        int32              `json:"id"`
+	Message   string             `json:"message"`
+	AppliedAt pgtype.Timestamptz `json:"applied_at"`
+}
+
 type Notification struct {
 	ID          string             `json:"id"`
 	UserID      string             `json:"user_id"`
