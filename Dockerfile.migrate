@@ -1,0 +1,11 @@
+FROM --platform=linux/arm64 migrate/migrate:v4.18.1
+
+USER root
+RUN apk add --no-cache jq ca-certificates
+
+COPY migrations/ /migrations/
+COPY scripts/run-migrate.sh /run-migrate.sh
+RUN chmod +x /run-migrate.sh
+
+ENTRYPOINT ["/run-migrate.sh"]
+CMD ["up"]
